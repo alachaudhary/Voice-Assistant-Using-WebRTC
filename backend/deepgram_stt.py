@@ -250,27 +250,23 @@ class DeepgramLiveTranscriber:
         self._send_to_browser({"type": "assistant", "text": assistant_text})
 
         if self.tts:
-            print("[TTS] synthesizing response...")
+            print("[TTS] streaming synthesis...")
 
             self.is_tts_playing = True
 
             try:
-                audio = self.tts.synthesize(assistant_text)
-                print("Received", len(audio), "bytes")
-                print("Seconds:", len(audio) / (24000 * 2))
+                def on_chunk(pcm_bytes: bytes) -> None:
+                    if self.tts_track:
+                        self.tts_track.enqueue(pcm_bytes)
 
-                if audio and self.tts_track:
-                    self.tts_track.enqueue(audio)
+                got_audio = self.tts.synthesize_stream(assistant_text, on_chunk)
 
-                    # Block this worker thread until playback has
-                    # actually finished draining out over WebRTC,
-                    # not just until synthesis returned.
-                    if self.tts_track.loop is not None:
-                        fut = asyncio.run_coroutine_threadsafe(
-                            self.tts_track.wait_until_done(),
-                            self.tts_track.loop,
-                        )
-                        fut.result()
+                if got_audio and self.tts_track and self.tts_track.loop is not None:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self.tts_track.wait_until_done(),
+                        self.tts_track.loop,
+                    )
+                    fut.result()
             finally:
                 self.is_tts_playing = False
 

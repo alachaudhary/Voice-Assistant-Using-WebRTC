@@ -6,6 +6,10 @@ const status = document.getElementById("status");
 const socket = new WebSocket("ws://localhost:8000/ws");
 
 const pc = new RTCPeerConnection();
+// Audio element for assistant speech
+const remoteAudio = new Audio();
+
+remoteAudio.autoplay = true;
 pc.onicecandidate = (event) => {
 
     if (event.candidate) {
@@ -26,7 +30,21 @@ pc.onconnectionstatechange = () => {
 pc.oniceconnectionstatechange = () => {
     console.log("ICE:", pc.iceConnectionState);
 };
+pc.ontrack = (event) => {
 
+    console.log("Received remote track:", event.track.kind);
+
+    if (event.track.kind === "audio") {
+
+        remoteAudio.srcObject = event.streams[0];
+
+        remoteAudio.play().catch(console.error);
+
+        console.log("Playing assistant audio");
+
+    }
+
+};
 socket.onopen = () => {
     console.log("✅ WebSocket Connected");
 };
@@ -52,6 +70,21 @@ socket.onmessage = async (event) => {
             await pc.addIceCandidate(message.candidate);
 
             console.log("Remote ICE Candidate Added");
+            break;
+
+        case "transcript":
+
+            addMessage(message.text, "user");
+            break;
+
+        case "assistant":
+
+            addMessage(message.text, "assistant");
+            break;
+
+        case "error":
+
+            addMessage(`⚠️ ${message.text}`, "assistant");
             break;
     }
 
@@ -134,4 +167,3 @@ micButton.addEventListener("click", async () => {
     }
 
 });
-
