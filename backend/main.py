@@ -26,6 +26,7 @@ resampler = av.AudioResampler(format="s16",layout="mono",rate=16000,)
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
+    deepgram.set_websocket(ws, asyncio.get_running_loop())
     audio_track.set_event_loop(
         asyncio.get_running_loop()
     )

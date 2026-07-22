@@ -1,18 +1,17 @@
 import asyncio
 import fractions
+import time
 
 import av
 import numpy as np
-from aiortc import MediaStreamTrack
+from aiortc import AudioStreamTrack
 
 
-class OutgoingAudioTrack(MediaStreamTrack):
+class OutgoingAudioTrack(AudioStreamTrack):
     """
     Streams ElevenLabs PCM audio over WebRTC.
     Expects 16-bit mono PCM @ 24000 Hz.
     """
-
-    kind = "audio"
 
     def __init__(self):
         super().__init__()
@@ -22,6 +21,7 @@ class OutgoingAudioTrack(MediaStreamTrack):
 
         # 20 ms per frame
         self.samples_per_frame = 480
+        self.frame_duration = self.samples_per_frame / self.sample_rate  # 0.02s
 
         # Buffer holding pending PCM samples
         self.buffer = np.empty((0,), dtype=np.int16)
@@ -35,6 +35,13 @@ class OutgoingAudioTrack(MediaStreamTrack):
         # RTP timestamp
         self.samples_sent = 0
 
+        # Signals when all queued/buffered audio has been played out
+        self._playback_done = asyncio.Event()
+        self._playback_done.set()
+
+        # Real-time pacing clock (incremental, resynced after idle gaps)
+        self._next_frame_time = None
+
     def set_event_loop(self, loop):
         self.loop = loop
 
@@ -42,10 +49,12 @@ class OutgoingAudioTrack(MediaStreamTrack):
         """
         Called from a worker thread after ElevenLabs synthesis.
         """
+        print("enqueue bytes:", len(pcm_bytes))
 
         if self.loop is None:
             return
 
+        self.loop.call_soon_threadsafe(self._playback_done.clear)
         self.loop.call_soon_threadsafe(
             self.queue.put_nowait,
             pcm_bytes,
@@ -54,45 +63,18 @@ class OutgoingAudioTrack(MediaStreamTrack):
     async def recv(self):
         """
         Called repeatedly by aiortc.
-        Returns exactly 20 ms of audio each call.
+        Returns exactly 20 ms of audio each call, paced to real time.
         """
-        print(
-    "Buffer:", len(self.buffer),
-    "Queue:", self.queue.qsize(),
-)
-        # If we don't have enough samples, fetch another chunk.
         while len(self.buffer) < self.samples_per_frame:
-            try:
-                pcm_bytes = await asyncio.wait_for(
-                    self.queue.get(),
-                    timeout=0.02,
-                )
+            pcm_bytes = await self.queue.get()
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
 
-                samples = np.frombuffer(
-                    pcm_bytes,
-                    dtype=np.int16,
-                )
+            if self.buffer.size == 0:
+                self.buffer = samples.copy()
+            else:
+                self.buffer = np.concatenate((self.buffer, samples))
 
-                if self.buffer.size == 0:
-                    self.buffer = samples.copy()
-                else:
-                    self.buffer = np.concatenate((self.buffer, samples))
-
-            except asyncio.TimeoutError:
-                silence = np.zeros(
-                    self.samples_per_frame,
-                    dtype=np.int16,
-                )
-
-                if self.buffer.size == 0:
-                    self.buffer = silence
-                else:
-                    self.buffer = np.concatenate((self.buffer, silence))
-
-        # Take exactly one WebRTC frame
         frame_samples = self.buffer[: self.samples_per_frame]
-
-        # Remove them from buffer
         self.buffer = self.buffer[self.samples_per_frame :]
 
         frame = av.AudioFrame.from_ndarray(
@@ -100,19 +82,31 @@ class OutgoingAudioTrack(MediaStreamTrack):
             format="s16",
             layout="mono",
         )
-
-
-
         frame.sample_rate = self.sample_rate
-
         frame.pts = self.samples_sent
+        frame.time_base = fractions.Fraction(1, self.sample_rate)
 
-        frame.time_base = fractions.Fraction(
-            1,
-            self.sample_rate,
-        )
+        # --- Real-time pacing (resyncs after idle gaps between turns) ---
+        now = time.monotonic()
 
+        if self._next_frame_time is None:
+            self._next_frame_time = now
+
+        # If we're behind by more than one frame, we just came off an idle
+        # gap (waiting for the next LLM/TTS turn) — resync to now instead
+        # of bursting frames to "catch up".
+        if now - self._next_frame_time > self.frame_duration:
+            self._next_frame_time = now
+
+        if self._next_frame_time > now:
+            await asyncio.sleep(self._next_frame_time - now)
+
+        self._next_frame_time += self.frame_duration
+        # -------------------------------------------------------------
 
         self.samples_sent += self.samples_per_frame
+
+        if self.buffer.size == 0 and self.queue.empty():
+            self._playback_done.set()
 
         return frame

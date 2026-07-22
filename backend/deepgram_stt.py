@@ -1,14 +1,13 @@
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
-
+import json
+import asyncio
 from deepgram import DeepgramClient
 from deepgram.core.events import EventType
-
 from config import DEEPGRAM_API_KEY
 from llm import ChatClient, ConversationHistory
-
+from typing import Any, Dict, List, Optional, Tuple
 
 class DeepgramLiveTranscriber:
     """Live microphone transcription using Deepgram's streaming WebSocket API."""
@@ -55,6 +54,10 @@ class DeepgramLiveTranscriber:
         self.is_tts_playing = False
         self._pending_final_transcript: Optional[str] = None
 
+        # Browser WebSocket, used to push transcripts/replies to app.js
+        self.ws = None
+        self.ws_loop = None
+
     def set_tts_client(self, tts_client) -> None:
         """Set the TTS client to automatically speak responses."""
         self.tts = tts_client
@@ -63,7 +66,24 @@ class DeepgramLiveTranscriber:
         """Set the WebRTC TTS track."""
         self.tts_track = tts_track
 
-    
+    def set_websocket(self, ws, loop) -> None:
+        """Set the FastAPI WebSocket + its event loop so we can push
+        chat messages (transcripts, assistant replies) to the browser
+        from this class's background threads."""
+        self.ws = ws
+        self.ws_loop = loop
+
+    def _send_to_browser(self, payload: dict) -> None:
+        """Thread-safe send of a JSON message to the connected browser."""
+        if self.ws is None or self.ws_loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.ws.send_text(json.dumps(payload)),
+                self.ws_loop,
+            )
+        except Exception as exc:
+            print(f"[WS] failed to send to browser: {exc}", file=sys.stderr)
 
     def _extract_transcript(self, response):
         """Extract transcript text from Deepgram listen response objects."""
@@ -208,6 +228,10 @@ class DeepgramLiveTranscriber:
             return
 
         print("[LLM] sending final transcript to LLM:", transcript)
+
+        # Show the user's transcript in the browser immediately
+        self._send_to_browser({"type": "transcript", "text": transcript})
+
         self.conversation_history.add_user_message(transcript)
         try:
             assistant_text = self.llm.create_chat_completion(
@@ -216,10 +240,14 @@ class DeepgramLiveTranscriber:
             )
         except Exception as exc:
             print("LLM request failed:", exc, file=sys.stderr)
+            self._send_to_browser({"type": "error", "text": "LLM request failed."})
             return
 
         self.conversation_history.add_assistant_message(assistant_text)
         print("[Assistant]", assistant_text)
+
+        # Show the assistant's reply in the browser
+        self._send_to_browser({"type": "assistant", "text": assistant_text})
 
         if self.tts:
             print("[TTS] synthesizing response...")
@@ -233,6 +261,16 @@ class DeepgramLiveTranscriber:
 
                 if audio and self.tts_track:
                     self.tts_track.enqueue(audio)
+
+                    # Block this worker thread until playback has
+                    # actually finished draining out over WebRTC,
+                    # not just until synthesis returned.
+                    if self.tts_track.loop is not None:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            self.tts_track.wait_until_done(),
+                            self.tts_track.loop,
+                        )
+                        fut.result()
             finally:
                 self.is_tts_playing = False
 
@@ -378,6 +416,3 @@ class DeepgramLiveTranscriber:
             return
 
         self.socket.send_media(audio_bytes)
-        
-
-
