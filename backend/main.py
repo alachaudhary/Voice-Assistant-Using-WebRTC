@@ -26,11 +26,9 @@ resampler = av.AudioResampler(format="s16",layout="mono",rate=16000,)
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-
     audio_track.set_event_loop(
         asyncio.get_running_loop()
     )
-
     pc = RTCPeerConnection()
     pc.addTrack(audio_track)
     @pc.on("track")

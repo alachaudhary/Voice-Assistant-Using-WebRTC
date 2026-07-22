@@ -56,7 +56,10 @@ class OutgoingAudioTrack(MediaStreamTrack):
         Called repeatedly by aiortc.
         Returns exactly 20 ms of audio each call.
         """
-
+        print(
+    "Buffer:", len(self.buffer),
+    "Queue:", self.queue.qsize(),
+)
         # If we don't have enough samples, fetch another chunk.
         while len(self.buffer) < self.samples_per_frame:
             try:
