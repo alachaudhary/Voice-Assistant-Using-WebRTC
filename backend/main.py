@@ -1,4 +1,5 @@
-
+import asyncio
+import av
 import json
 from fastapi import FastAPI, WebSocket
 from aiortc import (
@@ -7,6 +8,7 @@ from aiortc import (
     RTCIceCandidate,
 )
 from deepgram_stt import DeepgramLiveTranscriber
+from webrtc_audio_track import OutgoingAudioTrack
 
 from eleven_labs_tts import ElevenLabsTTS
 import uvicorn
@@ -16,37 +18,38 @@ app = FastAPI()
 
 deepgram = None
 tts = None
+audio_track = OutgoingAudioTrack()
 
-
+resampler = av.AudioResampler(format="s16",layout="mono",rate=16000,)
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
 
+    audio_track.set_event_loop(
+        asyncio.get_running_loop()
+    )
+
     pc = RTCPeerConnection()
+    pc.addTrack(audio_track)
     @pc.on("track")
     async def on_track(track):
 
-            print(f"Track received: {track.kind}")
-
             while True:
 
+                
+
+               
+
+                # Inside while True
                 frame = await track.recv()
 
-                print("Format:", frame.format.name)
-                print("Layout:", frame.layout.name)
-                pcm = frame.to_ndarray()
+                new_frames = resampler.resample(frame)
 
-                print(
-                    "Shape:", pcm.shape,
-                    "dtype:", pcm.dtype,
-                    "bytes:", len(pcm.tobytes())
-                )
-                print("Sample rate:", frame.sample_rate)
-
-
-                deepgram.send_audio(pcm.tobytes())
+                for new_frame in new_frames:
+                    pcm = new_frame.to_ndarray()
+                    deepgram.send_audio(pcm.tobytes())
                 
     @pc.on("icecandidate")
     async def on_icecandidate(candidate):
@@ -84,15 +87,9 @@ async def websocket_endpoint(ws: WebSocket):
             
 
         elif message["type"] == "candidate":
-
-            candidate = RTCIceCandidate.from_sdp(
-                message["candidate"]["candidate"]
-            )
-
-            candidate.sdpMid = message["candidate"]["sdpMid"]
-            candidate.sdpMLineIndex = message["candidate"]["sdpMLineIndex"]
-
-            await pc.addIceCandidate(candidate)
+            # Ignore ICE candidates for now.
+            # Browser and backend are on the same machine.
+            pass
 
 
 if __name__ == "__main__":
@@ -102,7 +99,7 @@ if __name__ == "__main__":
     deepgram = DeepgramLiveTranscriber()
 
     deepgram.set_tts_client(tts)
-
+    deepgram.set_tts_track(audio_track)
     deepgram.start()
 
     uvicorn.run(app, host="0.0.0.0", port=8000)

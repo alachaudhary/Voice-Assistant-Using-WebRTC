@@ -16,8 +16,8 @@ class DeepgramLiveTranscriber:
     def __init__(
         self,
         api_key: str = DEEPGRAM_API_KEY,
-        sample_rate: int = 48000,
-        channels: int = 2,
+        sample_rate: int = 16000,
+        channels: int = 1,
         model: str = "flux-general-en",
         language: str = "en",
         encoding: str = "linear16",
@@ -51,12 +51,17 @@ class DeepgramLiveTranscriber:
         self.llm = ChatClient()
         self.conversation_history = ConversationHistory(max_messages=llm_history_size)
         self.tts = None
+        self.tts_track = None
         self.is_tts_playing = False
         self._pending_final_transcript: Optional[str] = None
 
     def set_tts_client(self, tts_client) -> None:
         """Set the TTS client to automatically speak responses."""
         self.tts = tts_client
+
+    def set_tts_track(self, tts_track) -> None:
+        """Set the WebRTC TTS track."""
+        self.tts_track = tts_track
 
     
 
@@ -222,7 +227,12 @@ class DeepgramLiveTranscriber:
             self.is_tts_playing = True
 
             try:
-                self.tts.speak(assistant_text)
+                audio = self.tts.synthesize(assistant_text)
+                print("Received", len(audio), "bytes")
+                print("Seconds:", len(audio) / (24000 * 2))
+
+                if audio and self.tts_track:
+                    self.tts_track.enqueue(audio)
             finally:
                 self.is_tts_playing = False
 
@@ -235,7 +245,7 @@ class DeepgramLiveTranscriber:
             print(f"Unable to resolve LLM endpoint: {exc}", file=sys.stderr)
 
     def _on_message(self, message):
-
+        print(message)
         # Ignore microphone input while TTS is speaking
         if self.is_tts_playing:
             return
