@@ -3,3 +3,12 @@ uvicorn
 aiortc
 websockets
 numpy
+langchain
+langchain-community
+langchain-openai
+langchain-huggingface
+langchain-chroma
+chromadb
+sentence-transformers
+pypdf
+deepgram-sdk

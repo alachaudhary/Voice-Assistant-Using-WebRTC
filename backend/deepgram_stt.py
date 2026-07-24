@@ -9,6 +9,12 @@ from config import DEEPGRAM_API_KEY
 from llm import ChatClient, ConversationHistory
 from typing import Any, Dict, List, Optional, Tuple
 
+from rag.chain import RAGChain
+from rag.retriever import DocumentRetriever
+from rag.embeddings import EmbeddingService
+from rag.vectorstore import VectorStore
+
+
 class DeepgramLiveTranscriber:
     """Live microphone transcription using Deepgram's streaming WebSocket API."""
 
@@ -49,6 +55,23 @@ class DeepgramLiveTranscriber:
         self.socket = None
         self.llm = ChatClient()
         self.conversation_history = ConversationHistory(max_messages=llm_history_size)
+
+        # --- RAG setup ---
+        print("[RAG] Loading embedding model...")
+        embedding_model = EmbeddingService().get_model()
+
+        print("[RAG] Connecting to Chroma vectorstore...")
+        vectorstore = VectorStore(embedding_model).get_vectorstore()
+
+        self.retriever = DocumentRetriever(vectorstore)
+        self.rag = RAGChain(
+            retriever=self.retriever,
+            llm=self.llm,
+            conversation_history=self.conversation_history,
+        )
+        print("[RAG] Ready.")
+        # -----------------
+
         self.tts = None
         self.tts_track = None
         self.is_tts_playing = False
@@ -90,7 +113,6 @@ class DeepgramLiveTranscriber:
         if response is None:
             return None
 
-        # Handle Deepgram v1 socket response objects and raw dictionaries.
         if isinstance(response, dict):
             data = response
         else:
@@ -151,7 +173,6 @@ class DeepgramLiveTranscriber:
                         transcript = getattr(first_alt, "transcript")
                     return transcript.strip() if transcript else None
 
-        # Handle Deepgram v2 TurnInfo responses.
         if data.get("type") == "TurnInfo":
             transcript = None
             if isinstance(response, dict):
@@ -208,10 +229,7 @@ class DeepgramLiveTranscriber:
         if not transcript:
             return
 
-        # Remember what was sent
         self.last_sent_transcript = transcript
-
-        # Clear buffers so silence doesn't resend
         self.current_transcript = ""
         self._pending_final_transcript = None
 
@@ -227,23 +245,22 @@ class DeepgramLiveTranscriber:
         if not transcript:
             return
 
-        print("[LLM] sending final transcript to LLM:", transcript)
+        print("[LLM] sending final transcript to RAG chain:", transcript)
 
         # Show the user's transcript in the browser immediately
         self._send_to_browser({"type": "transcript", "text": transcript})
 
-        self.conversation_history.add_user_message(transcript)
         try:
-            assistant_text = self.llm.create_chat_completion(
-                self.conversation_history.messages,
-                transcript,
-            )
+            assistant_text = self.rag.invoke(transcript)
+
+            self.conversation_history.add_user_message(transcript)
+            self.conversation_history.add_assistant_message(assistant_text)
+
         except Exception as exc:
-            print("LLM request failed:", exc, file=sys.stderr)
+            print("RAG/LLM request failed:", exc, file=sys.stderr)
             self._send_to_browser({"type": "error", "text": "LLM request failed."})
             return
 
-        self.conversation_history.add_assistant_message(assistant_text)
         print("[Assistant]", assistant_text)
 
         # Show the assistant's reply in the browser
@@ -280,7 +297,6 @@ class DeepgramLiveTranscriber:
 
     def _on_message(self, message):
         print(message)
-        # Ignore microphone input while TTS is speaking
         if self.is_tts_playing:
             return
 
@@ -288,14 +304,11 @@ class DeepgramLiveTranscriber:
         is_final = self._is_final_message(message)
         message_type, event = self._get_message_type_and_event(message)
 
-        # Save the latest transcript
         if transcript:
             transcript = transcript.strip()
-
             if transcript:
                 self.current_transcript = transcript
 
-        # Debug output
         if transcript:
             label = "Final" if is_final else "Interim"
             print(f"[Deepgram {label}] {transcript}")
@@ -304,28 +317,21 @@ class DeepgramLiveTranscriber:
                 f"[Deepgram] message received type={message_type!r} event={event!r} with no transcript"
             )
 
-        # Final transcript received
         if is_final:
-
-            # Nothing to send
             if not self.current_transcript:
                 return
 
-            # Prevent duplicate sends
             if self.current_transcript == self.last_sent_transcript:
                 print("[Deepgram] Duplicate transcript ignored.")
                 return
 
-            # Save the COMPLETE sentence
             self._pending_final_transcript = self.current_transcript
 
-            # Flux v2 EndOfTurn
             if message_type == "TurnInfo" and event == "EndOfTurn":
                 print("[Deepgram] End of turn received.")
                 self._send_pending_transcript_to_llm()
                 return
 
-            # v1 UtteranceEnd
             if message_type == "UtteranceEnd":
                 print("[Deepgram] Utterance end received.")
                 self._send_pending_transcript_to_llm()
@@ -334,7 +340,6 @@ class DeepgramLiveTranscriber:
             print("[Deepgram] Waiting for EndOfTurn...")
             return
 
-        # Some Deepgram versions send EndOfTurn separately
         if (
             message_type == "TurnInfo"
             and event == "EndOfTurn"
@@ -351,35 +356,30 @@ class DeepgramLiveTranscriber:
             print("[Deepgram] Utterance end received.")
             self._send_pending_transcript_to_llm()
             return
+
     def _on_error(self, error):
         print("Deepgram error:", error, file=sys.stderr)
 
     def _on_close(self, _event):
         print("Deepgram connection closed.")
 
-   
-
     def _listen_socket(self):
         if self.socket is None:
             return
         self.socket.start_listening()
-        
-    def start(self):
 
+    def start(self):
         connect_kwargs = {
-        "model": self.model,
-        "encoding": self.encoding,
-        "sample_rate": self.sample_rate,
-        "eot_timeout_ms": self.utterance_end_ms,
-    }
+            "model": self.model,
+            "encoding": self.encoding,
+            "sample_rate": self.sample_rate,
+            "eot_timeout_ms": self.utterance_end_ms,
+        }
 
         if self.model == "flux-general-multi" and self.language:
             connect_kwargs["language_hint"] = self.language
 
-        # Keep the context manager alive
         self.socket_context = self.client.listen.v2.connect(**connect_kwargs)
-
-        # Enter the context manually
         self.socket = self.socket_context.__enter__()
 
         self.socket.on(EventType.OPEN, self._on_open)
@@ -391,11 +391,9 @@ class DeepgramLiveTranscriber:
             target=self._listen_socket,
             daemon=True,
         )
-
         listener.start()
 
     def stop(self):
-
         if self.socket:
             try:
                 self.socket.send_close_stream()
@@ -404,6 +402,7 @@ class DeepgramLiveTranscriber:
 
         if hasattr(self, "socket_context"):
             self.socket_context.__exit__(None, None, None)
+
     def send_audio(self, audio_bytes: bytes):
         if self.is_tts_playing:
             return

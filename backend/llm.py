@@ -35,12 +35,38 @@ class ChatClient:
         """Set the TTS client to automatically speak responses."""
         self.tts_client = tts_client
 
-    def build_messages(self, history: List[Dict[str, str]], user_message: str) -> List[Dict[str, str]]:
+    def build_messages(
+    self,
+    history,
+    user_message,
+    retrieved_context: str = "",
+):
         messages = [
             {"role": "system", "content": self.system_prompt},
         ]
+
+        if retrieved_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"""
+    Use ONLY the following company policy information to answer.
+
+    Context:
+    {retrieved_context}
+    """,
+                }
+            )
+
         messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
+
+        messages.append(
+            {
+                "role": "user",
+                "content": user_message,
+            }
+        )
+
         return messages
 
     def _build_payload(
@@ -49,10 +75,11 @@ class ChatClient:
         user_message: str,
         temperature: float,
         max_tokens: int,
+        retrieved_context: str = "",
     ) -> Dict[str, object]:
         return {
             "model": self.model,
-            "messages": self.build_messages(history, user_message),
+            "messages": self.build_messages(history,user_message,retrieved_context,),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
@@ -91,11 +118,12 @@ class ChatClient:
         self,
         history: List[Dict[str, str]],
         user_message: str,
+        retrieved_context: str = "",
         temperature: float = 0.7,
         max_tokens: int = 800,
     ) -> str:
         url = self._build_chat_url()
-        payload = self._build_payload(history, user_message, temperature, max_tokens)
+        payload = self._build_payload(history,user_message,temperature,max_tokens,retrieved_context,)
 
         request = urllib.request.Request(
             url,
